@@ -5,26 +5,21 @@ from pyspark.sql import functions as F
 from delta import configure_spark_with_delta_pip
 
 
-def create_spark_session(app_name: str) -> SparkSession:
+def create_spark_session() -> SparkSession:
     """
     Create and configure a SparkSession with Delta Lake support.
 
-    Args:
-        app_name: The name of the Spark application.
-
     Returns:
-        A configured SparkSession instance.
+        SparkSession: Configured Spark session instance.
     """
     spark = (
         configure_spark_with_delta_pip(
-            SparkSession.builder.appName(app_name)
+            SparkSession.builder.appName("filter_active_users_pipeline")
             .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
             .config(
                 "spark.sql.catalog.spark_catalog",
                 "org.apache.spark.sql.delta.catalog.DeltaCatalog",
             )
-            .config("spark.sql.adaptive.enabled", "true")
-            .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
         ).getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
@@ -40,133 +35,115 @@ def read_source(spark: SparkSession, source_path: str) -> DataFrame:
         source_path: S3 path to the source parquet files.
 
     Returns:
-        DataFrame containing the raw source data.
+        DataFrame: Raw source DataFrame.
     """
     print(f"[READ] Reading source parquet data from: {source_path}")
     df = spark.read.parquet(source_path)
-    row_count = df.count()
-    print(f"[READ] Source schema:")
-    df.printSchema()
-    print(f"[READ] Source row count: {row_count:,}")
+    print(f"[READ] Source row count: {df.count()}")
+    print(f"[READ] Source schema: {df.schema.simpleString()}")
     return df
-
-
-def validate_source(df: DataFrame) -> None:
-    """
-    Validate that the source DataFrame contains the expected columns.
-
-    Args:
-        df: Source DataFrame to validate.
-
-    Raises:
-        ValueError: If required columns are missing from the source data.
-    """
-    print("[VALIDATE] Validating source data schema...")
-    required_columns = ["status"]
-    missing_columns = [col for col in required_columns if col not in df.columns]
-    if missing_columns:
-        raise ValueError(
-            f"[VALIDATE] Missing required columns in source data: {missing_columns}. "
-            f"Available columns: {df.columns}"
-        )
-    print(f"[VALIDATE] Schema validation passed. Required columns present: {required_columns}")
-
-    null_status_count = df.filter(F.col("status").isNull()).count()
-    print(f"[VALIDATE] Rows with null 'status' (will be excluded by filter): {null_status_count:,}")
 
 
 def apply_filter_active_users(df: DataFrame) -> DataFrame:
     """
-    Filter the DataFrame to retain only rows where status equals 'active'.
+    Retain only rows where status is equal to 'active'.
 
-    Null values in the 'status' column are handled gracefully and excluded
-    from the output, as they do not satisfy the equality condition.
+    Uses a SQL string expression for the filter condition to ensure
+    compatibility regardless of SparkContext state at import time.
 
     Args:
         df: Input DataFrame containing user records.
 
     Returns:
-        Filtered DataFrame containing only active users.
+        DataFrame: Filtered DataFrame containing only active users.
     """
-    print("[TRANSFORM] Applying filter: Retain only rows where status = 'active'")
-    filter_condition = "status = 'active'"
-    df_filtered = df.filter(F.expr(filter_condition))
-    filtered_count = df_filtered.count()
-    print(f"[TRANSFORM] Filter condition applied: {filter_condition}")
-    print(f"[TRANSFORM] Rows after filter: {filtered_count:,}")
+    condition = "status = 'active'"
+    print(f"[TRANSFORM] Applying filter: Retain only rows where {condition}")
+    df_filtered = df.filter(condition)
     return df_filtered
+
+
+def handle_nulls(df: DataFrame) -> DataFrame:
+    """
+    Handle null values gracefully by dropping rows with null in critical columns.
+
+    Args:
+        df: Input DataFrame.
+
+    Returns:
+        DataFrame: DataFrame with null handling applied.
+    """
+    print("[TRANSFORM] Handling null values in critical columns...")
+    # Drop rows where 'status' column is null to avoid ambiguous filter results
+    df_clean = df.filter(F.col("status").isNotNull())
+    return df_clean
 
 
 def write_target(df: DataFrame, target_path: str) -> None:
     """
-    Write the transformed DataFrame to the target S3 location in parquet format
-    using Delta Lake overwrite mode.
+    Write the processed DataFrame to the target S3 path in parquet format
+    using overwrite mode.
 
     Args:
-        df: Transformed DataFrame to write.
-        target_path: S3 path for the target output location.
+        df: Processed DataFrame to write.
+        target_path: S3 path for the output parquet files.
     """
     print(f"[WRITE] Writing output to: {target_path}")
-    print(f"[WRITE] Write mode: overwrite | Format: parquet")
+    print(f"[WRITE] Output row count: {df.count()}")
     (
         df.write
         .format("parquet")
         .mode("overwrite")
         .save(target_path)
     )
-    print(f"[WRITE] Successfully written data to: {target_path}")
+    print(f"[WRITE] Successfully written to: {target_path}")
 
 
 def run() -> None:
     """
     Execute the filter_active_users_pipeline end-to-end.
 
-    Pipeline Steps:
+    Pipeline steps:
         1. Create SparkSession with Delta Lake configuration.
-        2. Read raw user data from S3 (parquet).
-        3. Validate source schema and data quality.
-        4. Apply filter to retain only active users (status = 'active').
-        5. Write filtered data to the processed S3 bucket (parquet, overwrite).
-        6. Stop SparkSession.
+        2. Read raw user parquet data from S3 source.
+        3. Handle null values in critical columns.
+        4. Filter to retain only active users.
+        5. Write processed data to S3 target in parquet format.
     """
-    pipeline_name = "filter_active_users_pipeline"
+    print("[PIPELINE] Starting filter_active_users_pipeline")
+
+    # Step 1: Initialise Spark
+    print("[PIPELINE] Step 1/5 - Initialising SparkSession...")
+    spark = create_spark_session()
+    print("[PIPELINE] SparkSession initialised successfully.")
+
     source_path = "s3://etl-agent-raw/users/"
     target_path = "s3://etl-agent-processed/active-users/"
-
-    print(f"[PIPELINE] Starting pipeline: {pipeline_name}")
-    print(f"[PIPELINE] Source: {source_path}")
-    print(f"[PIPELINE] Target: {target_path}")
-
-    # Step 1: Create SparkSession
-    print("[PIPELINE] Step 1/5 - Initialising SparkSession...")
-    spark = create_spark_session(pipeline_name)
-    print(f"[PIPELINE] SparkSession created. Spark version: {spark.version}")
 
     try:
         # Step 2: Read source data
         print("[PIPELINE] Step 2/5 - Reading source data...")
         df_raw = read_source(spark, source_path)
 
-        # Step 3: Validate source data
-        print("[PIPELINE] Step 3/5 - Validating source data...")
-        validate_source(df_raw)
+        # Step 3: Handle nulls
+        print("[PIPELINE] Step 3/5 - Handling null values...")
+        df_no_nulls = handle_nulls(df_raw)
 
-        # Step 4: Apply transformations
-        print("[PIPELINE] Step 4/5 - Applying transformations...")
-        df_active_users = apply_filter_active_users(df_raw)
+        # Step 4: Apply filter transformation
+        print("[PIPELINE] Step 4/5 - Applying filter transformation...")
+        df_active = apply_filter_active_users(df_no_nulls)
 
         # Step 5: Write output
         print("[PIPELINE] Step 5/5 - Writing output data...")
-        write_target(df_active_users, target_path)
+        write_target(df_active, target_path)
 
-        print(f"[PIPELINE] Pipeline '{pipeline_name}' completed successfully.")
+        print("[PIPELINE] filter_active_users_pipeline completed successfully.")
 
-    except Exception as e:
-        print(f"[PIPELINE] ERROR: Pipeline '{pipeline_name}' failed with exception: {e}")
+    except Exception as exc:
+        print(f"[PIPELINE] Pipeline failed with error: {exc}")
         raise
 
     finally:
-        print("[PIPELINE] Stopping SparkSession...")
         spark.stop()
         print("[PIPELINE] SparkSession stopped.")
 
