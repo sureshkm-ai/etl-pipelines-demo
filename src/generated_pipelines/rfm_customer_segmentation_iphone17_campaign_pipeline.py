@@ -6,9 +6,8 @@ scores for Amazon customers to identify high-value targets for the iPhone 17
 launch campaign.
 """
 
-from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import SparkSession, DataFrame, Window
 from pyspark.sql import functions as F
-from pyspark.sql import Window
 from delta import configure_spark_with_delta_pip
 
 
@@ -20,7 +19,7 @@ TARGET_PATH: str = "s3://etl-agent-artifacts-prod/analytics/rfm_scores/"
 APP_NAME: str = "rfm_customer_segmentation_iphone17_campaign_pipeline"
 
 EXCLUDED_STATUSES: list[str] = ["CANCELLED", "RETURNED"]
-RFM_BUCKETS: int = 5
+NTILE_BUCKETS: int = 5
 
 
 # ---------------------------------------------------------------------------
@@ -43,10 +42,9 @@ def create_spark_session() -> SparkSession:
             "spark.sql.catalog.spark_catalog",
             "org.apache.spark.sql.delta.catalog.DeltaCatalog",
         )
-        # Adaptive query execution for large aggregations
+        # Improve stability for large aggregations
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        # Allow window functions across the full dataset
         .config("spark.sql.shuffle.partitions", "200")
     )
     spark = configure_spark_with_delta_pip(builder).getOrCreate()
@@ -58,9 +56,9 @@ def create_spark_session() -> SparkSession:
 # Step 1 – Ingest
 # ---------------------------------------------------------------------------
 
-def read_orders(spark: SparkSession) -> DataFrame:
+def read_source(spark: SparkSession) -> DataFrame:
     """
-    Read raw Amazon orders from the S3 Parquet source.
+    Read raw Amazon orders from S3 in Parquet format.
 
     Parameters
     ----------
@@ -72,7 +70,7 @@ def read_orders(spark: SparkSession) -> DataFrame:
     DataFrame
         Raw orders DataFrame.
     """
-    print(f"[INGEST] Reading Parquet source from: {SOURCE_PATH}")
+    print(f"[INGEST] Reading source parquet data from: {SOURCE_PATH}")
     df = spark.read.parquet(SOURCE_PATH)
     row_count = df.count()
     print(f"[INGEST] Source rows loaded: {row_count:,}")
@@ -86,13 +84,10 @@ def read_orders(spark: SparkSession) -> DataFrame:
 
 def filter_invalid_orders(df: DataFrame) -> DataFrame:
     """
-    Exclude cancelled and returned orders, and drop rows with critical nulls.
+    Exclude cancelled and returned orders from the dataset.
 
-    Transformation
-    --------------
-    - Remove rows where ``order_status`` is 'CANCELLED' or 'RETURNED'.
-    - Drop rows where ``customer_id``, ``order_id``, ``order_date``, or
-      ``order_value`` are null (required for RFM computation).
+    Rows where ``order_status`` is NULL are also dropped to avoid
+    polluting downstream aggregations.
 
     Parameters
     ----------
@@ -102,48 +97,46 @@ def filter_invalid_orders(df: DataFrame) -> DataFrame:
     Returns
     -------
     DataFrame
-        Filtered DataFrame containing only valid, actionable orders.
+        Filtered DataFrame containing only valid orders.
     """
     print("[FILTER] Excluding CANCELLED and RETURNED orders...")
+    print(f"[FILTER] Also dropping rows with NULL order_status or NULL customer_id.")
 
-    # Guard: ensure order_status nulls don't accidentally pass through
-    df_filtered = df.filter(
-        F.col("order_status").isNotNull()
-        & ~F.col("order_status").isin(EXCLUDED_STATUSES)
+    df_filtered = (
+        df.filter(F.col("order_status").isNotNull())
+        .filter(~F.col("order_status").isin(EXCLUDED_STATUSES))
+        .filter(F.col("customer_id").isNotNull())
+        .filter(F.col("order_id").isNotNull())
+        .filter(F.col("order_date").isNotNull())
+        # Treat NULL / negative order_value as zero to keep the customer record
+        .withColumn(
+            "order_value",
+            F.when(
+                F.col("order_value").isNull() | (F.col("order_value") < 0),
+                F.lit(0.0),
+            ).otherwise(F.col("order_value").cast("double")),
+        )
     )
 
-    print("[FILTER] Dropping rows with null values in critical columns...")
-    critical_columns: list[str] = ["customer_id", "order_id", "order_date", "order_value"]
-    df_clean = df_filtered.dropna(subset=critical_columns)
-
-    # Coerce types defensively
-    df_clean = (
-        df_clean
-        .withColumn("order_date", F.col("order_date").cast("date"))
-        .withColumn("order_value", F.col("order_value").cast("double"))
-        .withColumn("order_id", F.col("order_id").cast("string"))
-        .withColumn("customer_id", F.col("customer_id").cast("string"))
-    )
-
-    row_count = df_clean.count()
+    row_count = df_filtered.count()
     print(f"[FILTER] Rows after filtering: {row_count:,}")
-    return df_clean
+    return df_filtered
 
 
 # ---------------------------------------------------------------------------
-# Step 3 – Aggregate (RFM base metrics)
+# Step 3 – Aggregate (Recency, Frequency, Monetary)
 # ---------------------------------------------------------------------------
 
-def compute_rfm_base_metrics(df: DataFrame) -> DataFrame:
+def compute_rfm_base(df: DataFrame) -> DataFrame:
     """
-    Aggregate orders to compute per-customer RFM base metrics.
+    Compute per-customer RFM base metrics.
 
-    Aggregations
-    ------------
-    - ``last_order_date``  : MAX(order_date)  – most recent purchase date.
-    - ``frequency``        : COUNT(order_id)  – total number of orders.
-    - ``monetary``         : SUM(order_value) – total spend.
-    - ``recency_days``     : DATEDIFF(current_date, last_order_date).
+    Metrics computed
+    ----------------
+    * ``last_order_date``  – most recent order date (MAX)
+    * ``frequency``        – total number of orders (COUNT)
+    * ``monetary``         – total spend (SUM of order_value)
+    * ``recency_days``     – calendar days between last order and today
 
     Parameters
     ----------
@@ -155,7 +148,7 @@ def compute_rfm_base_metrics(df: DataFrame) -> DataFrame:
     DataFrame
         One row per customer with RFM base metrics.
     """
-    print("[AGGREGATE] Computing per-customer RFM base metrics...")
+    print("[AGGREGATE] Computing recency, frequency, and monetary per customer...")
 
     df_agg = df.groupBy("customer_id").agg(
         F.max("order_date").alias("last_order_date"),
@@ -169,12 +162,11 @@ def compute_rfm_base_metrics(df: DataFrame) -> DataFrame:
         F.datediff(F.current_date(), F.col("last_order_date")),
     )
 
-    # Null-safe defaults: if monetary is somehow null after sum, default to 0
-    df_agg = (
-        df_agg
-        .withColumn("monetary", F.coalesce(F.col("monetary"), F.lit(0.0)))
-        .withColumn("frequency", F.coalesce(F.col("frequency"), F.lit(0)))
-        .withColumn("recency_days", F.coalesce(F.col("recency_days"), F.lit(9999)))
+    # Guard against NULL recency (e.g. future-dated orders)
+    df_agg = df_agg.withColumn(
+        "recency_days",
+        F.when(F.col("recency_days").isNull() | (F.col("recency_days") < 0), F.lit(0))
+        .otherwise(F.col("recency_days")),
     )
 
     row_count = df_agg.count()
@@ -183,29 +175,22 @@ def compute_rfm_base_metrics(df: DataFrame) -> DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Step 4 – Enrich (RFM scoring via ntile bucketing)
+# Step 4 – Enrich (RFM Scoring & Segmentation)
 # ---------------------------------------------------------------------------
 
 def enrich_rfm_scores(df: DataFrame) -> DataFrame:
     """
-    Score each customer 1–5 on Recency, Frequency, and Monetary dimensions
-    using ntile window bucketing, then derive a composite RFM segment label.
+    Score each customer 1-5 on each RFM dimension using ntile bucketing,
+    then derive a composite ``rfm_score`` and human-readable ``rfm_segment``.
 
-    Scoring Logic
+    Scoring logic
     -------------
-    - ``r_score`` : ntile(5) ORDER BY recency_days DESC
-                    (higher score = purchased more recently).
-    - ``f_score`` : ntile(5) ORDER BY frequency ASC
-                    (higher score = ordered more frequently).
-    - ``m_score`` : ntile(5) ORDER BY monetary ASC
-                    (higher score = spent more).
-    - ``rfm_score``: r_score + f_score + m_score  (range 3–15).
-    - ``rfm_segment``:
-        * Champions        : rfm_score >= 13
-        * Loyal Customers  : rfm_score >= 10
-        * Potential Loyalists: rfm_score >= 7
-        * At Risk          : rfm_score >= 4
-        * Lost             : rfm_score < 4
+    * ``r_score`` – ntile(5) ordered by recency_days ASC
+      (lower recency = higher score, i.e. more recent customers score higher)
+    * ``f_score`` – ntile(5) ordered by frequency ASC
+    * ``m_score`` – ntile(5) ordered by monetary ASC
+    * ``rfm_score`` = r_score + f_score + m_score  (range 3–15)
+    * ``rfm_segment`` – label derived from rfm_score thresholds
 
     Parameters
     ----------
@@ -217,28 +202,28 @@ def enrich_rfm_scores(df: DataFrame) -> DataFrame:
     DataFrame
         Enriched DataFrame with RFM scores and segment labels.
     """
-    print(f"[ENRICH] Applying ntile({RFM_BUCKETS}) bucketing for RFM scores...")
+    print("[ENRICH] Applying ntile(5) bucketing for R, F, M dimensions...")
 
-    # Window specs – no partition, order across entire dataset
-    w_recency = Window.orderBy(F.col("recency_days").desc())
+    # Window specs – no partition, order by each metric
+    # NOTE: For recency, lower days = more recent = better, so ASC gives
+    #       ntile bucket 1 to the least recent and 5 to the most recent.
+    w_recency = Window.orderBy(F.col("recency_days").asc())
     w_frequency = Window.orderBy(F.col("frequency").asc())
     w_monetary = Window.orderBy(F.col("monetary").asc())
 
     df_scored = (
         df
-        .withColumn("r_score", F.ntile(RFM_BUCKETS).over(w_recency))
-        .withColumn("f_score", F.ntile(RFM_BUCKETS).over(w_frequency))
-        .withColumn("m_score", F.ntile(RFM_BUCKETS).over(w_monetary))
+        # Individual dimension scores
+        .withColumn("r_score", F.ntile(NTILE_BUCKETS).over(w_recency))
+        .withColumn("f_score", F.ntile(NTILE_BUCKETS).over(w_frequency))
+        .withColumn("m_score", F.ntile(NTILE_BUCKETS).over(w_monetary))
+        # Composite score
+        .withColumn("rfm_score", F.col("r_score") + F.col("f_score") + F.col("m_score"))
     )
 
-    # Composite score
-    df_scored = df_scored.withColumn(
-        "rfm_score",
-        F.col("r_score") + F.col("f_score") + F.col("m_score"),
-    )
+    print("[ENRICH] Deriving rfm_segment labels from composite rfm_score...")
 
-    # Segment label
-    df_scored = df_scored.withColumn(
+    df_enriched = df_scored.withColumn(
         "rfm_segment",
         F.when(F.col("rfm_score") >= 13, F.lit("Champions"))
         .when(F.col("rfm_score") >= 10, F.lit("Loyal Customers"))
@@ -247,31 +232,38 @@ def enrich_rfm_scores(df: DataFrame) -> DataFrame:
         .otherwise(F.lit("Lost")),
     )
 
-    # Audit: segment distribution
-    print("[ENRICH] RFM segment distribution:")
-    df_scored.groupBy("rfm_segment").count().orderBy("rfm_segment").show(truncate=False)
+    # Add pipeline metadata columns
+    df_enriched = df_enriched.withColumn(
+        "pipeline_run_ts", F.current_timestamp()
+    ).withColumn(
+        "pipeline_name", F.lit(APP_NAME)
+    )
 
-    return df_scored
+    print("[ENRICH] Segment distribution preview:")
+    df_enriched.groupBy("rfm_segment").count().orderBy("rfm_segment").show(
+        truncate=False
+    )
+
+    return df_enriched
 
 
 # ---------------------------------------------------------------------------
 # Step 5 – Write
 # ---------------------------------------------------------------------------
 
-def write_rfm_scores(df: DataFrame) -> None:
+def write_delta(df: DataFrame) -> None:
     """
-    Write the enriched RFM scores DataFrame to Delta Lake (overwrite mode).
+    Persist the enriched RFM DataFrame to Delta Lake (overwrite mode).
 
     Parameters
     ----------
     df : DataFrame
-        Final enriched RFM scores DataFrame.
+        Final enriched RFM DataFrame to persist.
     """
     print(f"[WRITE] Writing RFM scores to Delta Lake at: {TARGET_PATH}")
 
     (
-        df.write
-        .format("delta")
+        df.write.format("delta")
         .mode("overwrite")
         .option("overwriteSchema", "true")
         .save(TARGET_PATH)
@@ -286,47 +278,47 @@ def write_rfm_scores(df: DataFrame) -> None:
 
 def run() -> None:
     """
-    Execute the full RFM customer segmentation pipeline for the iPhone 17
-    launch campaign.
+    Execute the full RFM customer segmentation pipeline end-to-end.
 
-    Pipeline Steps
+    Pipeline steps
     --------------
-    1. Create SparkSession with Delta Lake configuration.
-    2. Ingest raw Amazon orders from S3 Parquet.
-    3. Filter out CANCELLED / RETURNED orders and null-critical rows.
-    4. Aggregate per-customer Recency, Frequency, and Monetary metrics.
-    5. Enrich with ntile-based RFM scores and segment labels.
-    6. Write results to Delta Lake (overwrite).
+    1. Create SparkSession
+    2. Ingest raw orders from S3 (Parquet)
+    3. Filter out CANCELLED / RETURNED orders
+    4. Aggregate per-customer RFM base metrics
+    5. Enrich with ntile scores and segment labels
+    6. Write results to Delta Lake
     """
     print("=" * 70)
     print(f"[PIPELINE] Starting: {APP_NAME}")
     print("=" * 70)
 
+    # 1. Session
     spark = create_spark_session()
     print(f"[PIPELINE] Spark version: {spark.version}")
 
     try:
-        # Step 1 – Ingest
-        df_raw = read_orders(spark)
+        # 2. Ingest
+        df_raw = read_source(spark)
 
-        # Step 2 – Filter
+        # 3. Filter
         df_filtered = filter_invalid_orders(df_raw)
 
-        # Step 3 – Aggregate
-        df_aggregated = compute_rfm_base_metrics(df_filtered)
+        # 4. Aggregate
+        df_rfm_base = compute_rfm_base(df_filtered)
 
-        # Step 4 – Enrich
-        df_enriched = enrich_rfm_scores(df_aggregated)
+        # 5. Enrich
+        df_rfm_final = enrich_rfm_scores(df_rfm_base)
 
-        # Step 5 – Write
-        write_rfm_scores(df_enriched)
+        # 6. Write
+        write_delta(df_rfm_final)
 
         print("=" * 70)
         print(f"[PIPELINE] Successfully completed: {APP_NAME}")
         print("=" * 70)
 
     except Exception as exc:  # noqa: BLE001
-        print(f"[PIPELINE] FATAL ERROR: {exc}")
+        print(f"[PIPELINE] FATAL ERROR – pipeline aborted: {exc}")
         raise
 
     finally:
